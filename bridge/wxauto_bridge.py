@@ -864,10 +864,12 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
     def _return_to_session_list():
         """返回微信聊天列表，确保离开会话内部视图。"""
         try:
+            _ensure_foreground(wx)
             wx.A_ChatIcon.DoubleClick(simulateMove=False)
             time.sleep(0.3)
-        except Exception:
-            pass
+            logger.debug("_return_to_session_list: 已双击聊天图标")
+        except Exception as e:
+            logger.warning("_return_to_session_list 失败: %s", e)
 
     # ── 构建待处理会话队列 ────────────────────────────────
     # 核心防护：只有未读数相比上次 Poll 增加时，才打开会话检查
@@ -998,6 +1000,7 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
     if not pending_messages:
         if len(updated_seen) > len(seen):
             save_seen(updated_seen)
+        _return_to_session_list()
         return updated_seen
 
     logger.info("Phase1 完成: 采集 %d 条消息 %d 个会话",
@@ -1033,6 +1036,7 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
 
     if not reply_queue:
         logger.info("Phase2: 无待投递回复")
+        _return_to_session_list()
         return updated_seen
 
     # ═══════════════════════════════════════════════════════
@@ -1073,6 +1077,8 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                 len(pending_messages), len(reply_queue), delivered,
                 rl.daily_total, DAILY_TOTAL_LIMIT)
 
+    # 保证返回聊天列表，下一轮 Poll 才能正确读取 GetSessionList
+    _return_to_session_list()
     return updated_seen
 
 # ═══════════════════════════════════════════════════════════════
