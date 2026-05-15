@@ -413,6 +413,28 @@ def minimize_wechat(wx):
     except Exception:
         pass
 
+
+def _ensure_foreground(wx):
+    """临时将微信窗口带到前台，确保 SendKeys 正确送达。
+
+    SendKeys 发向当前焦点窗口。微信在后台时按键会被其他窗口拦截，导致
+    搜索框输入无效、ESC 无法返回列表、ENTER 打开错误会话。
+    调用者在需要键盘输入前调用此函数，操作完成后应尽快释放焦点。
+    """
+    try:
+        import win32gui
+        import win32con
+        hwnd = getattr(wx, 'HWND', 0)
+        if not hwnd:
+            return False
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+        return True
+    except Exception:
+        return False
+
 # ═══════════════════════════════════════════════════════════════
 # ── 消息发送 ─────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════
@@ -468,6 +490,30 @@ def verify_chat_window(wx, expected_name):
 
     logger.warning("窗口验证失败: 期望=%s UIA=%s win32=%s",
                    expected_name[:20], current_uia[:30], current_win32[:30])
+    return False
+
+
+def wait_chat_stable(wx, target_name, max_wait=3.0, check_interval=0.3):
+    """验证微信窗口标题已切换到目标会话，连续两次匹配才确认切换完成。
+    同时检查 UIA 和 win32gui 两种路径，任一匹配即可。
+    max_wait: 最长等待秒数，超时返回 False。"""
+    deadline = time.time() + max_wait
+    last_match = False
+    while time.time() < deadline:
+        uia_name = get_current_chat_name(wx)
+        win32_name = get_chat_name_win32(wx)
+        current = uia_name or win32_name
+        if current and (target_name in current or current in target_name):
+            if last_match:
+                return True
+            last_match = True
+        else:
+            last_match = False
+        time.sleep(check_interval)
+    logger.warning("wait_chat_stable 验证超时: 期望='%s' UIA='%s' win32='%s'",
+                   target_name[:20],
+                   get_current_chat_name(wx)[:30],
+                   get_chat_name_win32(wx)[:30])
     return False
 
 
@@ -562,17 +608,37 @@ def prime_startup_messages(wx, seen):
         if ALLOW_SESSIONS and who not in ALLOW_SESSIONS:
             continue
 
-        # 打开会话（搜索+ENTER 方式，WeChat 3.9.12 兼容）
+        # 打开会话（搜索+侧边栏点击，不使用 ENTER 避免串群）
         try:
-            # 搜索 + ENTER 打开会话
+            import re as _re
+            pattern = f'^{_re.escape(who)}(\\d+条新消息)?(已置顶)?$'
+
+            # 先返回聊天列表
+            wx.A_ChatIcon.DoubleClick(simulateMove=False)
+            time.sleep(0.3)
+
+            # 搜索过滤
+            _ensure_foreground(wx)
             wx.B_Search.Click(simulateMove=False)
+            time.sleep(0.15)
+            wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.2)
             time.sleep(0.1)
-            wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.3)
-            time.sleep(0.1)
-            wx.B_Search.SendKeys(who, waitTime=0.5)
-            time.sleep(0.5)
-            wx.UiaAPI.SendKeys('{ENTER}', waitTime=0.5)
+            wx.B_Search.SendKeys(who, waitTime=1.0)
             time.sleep(0.8)
+
+            # 侧边栏 RegexName 精确点击
+            item = wx.SessionBox.ListItemControl(RegexName=pattern)
+            if item.Exists(2.0):
+                item.Click(simulateMove=False)
+                time.sleep(0.5)
+                if not wait_chat_stable(wx, who, max_wait=2.0):
+                    logger.warning("清积压: 窗口验证失败 %s，跳过", who[:20])
+                    wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
+                    time.sleep(0.2)
+                    continue
+            else:
+                logger.warning("清积压: 搜索未找到 %s，跳过", who[:20])
+                continue
 
             # 获取所有消息并指纹
             msgs = wx.GetAllMessage()
@@ -645,16 +711,19 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
             return _strip_badges(item.Name) if item.Name else item.Name
 
     def _open_session(target_name):
-        """打开微信会话。
-        1. A_ChatIcon.DoubleClick() 先强制返回聊天列表
-        2. RegexName 侧边栏精确点击 — 只在聊天列表有效，不走搜索防串群
-        3. 兜底: B_Search 搜索 + ENTER
+        """打开微信会话（三步递进，每步验证窗口切换）。
+
+        1. RegexName 侧边栏精确点击 → 验证窗口
+        2. Sibling 遍历精确匹配 → 验证窗口
+        3. 搜索过滤 + 侧边栏点击 → 验证窗口（不使用 ENTER）
+
+        任一步验证通过即返回 True。三步全失败返回 False，
+        调用方应跳过此会话。旧版永远返回 True 是串聊回复的根因。
         """
         import re as _re
+        pattern = f'^{_re.escape(target_name)}(\\d+条新消息)?(已置顶)?$'
 
-        # ═══════════════════════════════════════════════════
-        # Step 0: 强制返回聊天列表（A_ChatIcon.DoubleClick）
-        # ═══════════════════════════════════════════════════
+        # ── Step 0: 返回聊天列表 ──────────────────────────
         try:
             wx.A_ChatIcon.DoubleClick(simulateMove=False)
             time.sleep(0.5)
@@ -665,24 +734,21 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
         time.sleep(0.3)
 
-        # ═══════════════════════════════════════════════════
-        # Step 1: RegexName 侧边栏精确点击
-        # ═══════════════════════════════════════════════════
-        pattern = f'^{_re.escape(target_name)}(\\d+条新消息)?(已置顶)?$'
+        # ── Step 1: RegexName 精确匹配 → 验证 ─────────────
         try:
             item = wx.SessionBox.ListItemControl(RegexName=pattern)
             if item.Exists(2.0):
                 logger.info("_open: RegexName 命中 '%s'", target_name[:20])
                 item.Click(simulateMove=False)
-                time.sleep(0.8)
-                logger.info("_open: RegexName -> '%s'", target_name[:20])
-                return True
+                time.sleep(0.5)
+                if _wait_chat_stable(target_name):
+                    logger.info("_open: RegexName -> '%s'", target_name[:20])
+                    return True
+                logger.warning("_open: RegexName 点击后验证失败 '%s'", target_name[:20])
         except Exception:
             pass
 
-        # ═══════════════════════════════════════════════════
-        # Step 2: Sibling 遍历精确匹配
-        # ═══════════════════════════════════════════════════
+        # ── Step 2: Sibling 遍历精确匹配 → 验证 ──────────
         item = wx.SessionBox.ListItemControl()
         for _ in range(80):
             try:
@@ -692,19 +758,21 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                 if name == target_name:
                     logger.info("_open: sibling 匹配 '%s'", name[:25])
                     item.Click(simulateMove=False)
-                    time.sleep(0.8)
-                    logger.info("_open: sibling -> '%s'", target_name[:20])
-                    return True
+                    time.sleep(0.5)
+                    if _wait_chat_stable(target_name):
+                        logger.info("_open: sibling -> '%s'", target_name[:20])
+                        return True
+                    logger.warning("_open: sibling 验证失败 '%s'", target_name[:20])
+                    break
                 item = item.GetNextSiblingControl()
                 if item is None:
                     break
             except Exception:
                 break
 
-        # ═══════════════════════════════════════════════════
-        # Step 3: B_Search + ENTER 兜底
-        # ═══════════════════════════════════════════════════
+        # ── Step 3: 搜索过滤 + 侧边栏点击（不使用 ENTER） ──
         try:
+            _ensure_foreground(wx)
             wx.B_Search.Click(simulateMove=False)
         except Exception:
             pass
@@ -712,38 +780,55 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.2)
         time.sleep(0.1)
         wx.B_Search.SendKeys(target_name, waitTime=1.0)
-        time.sleep(0.5)
-        wx.UiaAPI.SendKeys('{ENTER}', waitTime=1.0)
-        time.sleep(0.5)
-        logger.info("_open: ENTER 兜底 -> '%s'", target_name[:20])
-        return True
+        time.sleep(0.8)
+
+        # 搜索过滤后重新尝试 RegexName
+        try:
+            item = wx.SessionBox.ListItemControl(RegexName=pattern)
+            if item.Exists(2.0):
+                logger.info("_open: 搜索+RegexName 命中 '%s'", target_name[:20])
+                item.Click(simulateMove=False)
+                time.sleep(0.5)
+                if _wait_chat_stable(target_name):
+                    logger.info("_open: 搜索+RegexName -> '%s'", target_name[:20])
+                    return True
+        except Exception:
+            pass
+
+        # 搜索后 Sibling 遍历兜底
+        item = wx.SessionBox.ListItemControl()
+        for _ in range(80):
+            try:
+                if item is None:
+                    break
+                name = _get_session_name(item)
+                if name == target_name:
+                    logger.info("_open: 搜索+sibling 匹配 '%s'", name[:25])
+                    item.Click(simulateMove=False)
+                    time.sleep(0.5)
+                    if _wait_chat_stable(target_name):
+                        logger.info("_open: 搜索+sibling -> '%s'", target_name[:20])
+                        return True
+                    break
+                item = item.GetNextSiblingControl()
+                if item is None:
+                    break
+            except Exception:
+                break
+
+        logger.warning("_open_session 全部失败: '%s'", target_name[:20])
+        return False
 
     def _wait_chat_stable(target_name, max_wait=3.0, check_interval=0.3):
-        deadline = time.time() + max_wait
-        last_match = False
-        while time.time() < deadline:
-            uia_name = get_current_chat_name(wx)
-            win32_name = get_chat_name_win32(wx)
-            current = uia_name or win32_name
-            if current and (target_name in current or current in target_name):
-                if last_match:
-                    return True
-                last_match = True
-            else:
-                last_match = False
-            time.sleep(check_interval)
-        # 即使 UIA 验证未通过，给予额外等待时间后假定切换成功
-        # (UIA ChatBox 文本可能滞后，BSearch+ENTER 导航已验证可靠)
-        logger.debug("_wait_chat_stable: UIA 验证超时，假定切换成功")
-        time.sleep(0.5)
-        return True
+        """验证窗口标题已切换到目标会话，连续两次匹配才确认。"""
+        return wait_chat_stable(wx, target_name, max_wait, check_interval)
 
     def _return_to_session_list():
-        """返回微信聊天列表：双击"聊天"图标 + ESC 确保离开会话视图。
-        A_ChatIcon.DoubleClick 是 wxauto GetNewMessage 同款做法。"""
+        """返回微信聊天列表，确保离开会话内部视图。"""
         try:
             wx.A_ChatIcon.DoubleClick(simulateMove=False)
         except Exception:
+            _ensure_foreground(wx)
             wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
         time.sleep(0.3)
         wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
@@ -789,7 +874,13 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                 logger.warning("Phase1: 无法打开会话 %s", who[:20])
                 _return_to_session_list()
                 continue
-            time.sleep(0.5)
+
+            # 二次验证：确保窗口稳定后再采集
+            if not _wait_chat_stable(who, max_wait=2.0):
+                logger.warning("Phase1: 打开后验证失败 %s，跳过", who[:20])
+                _return_to_session_list()
+                continue
+
             try:
                 msgs = wx.GetAllMessage()
             except Exception as e:
@@ -905,6 +996,11 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
     for pm in reply_queue:
         if not _open_session(pm['chat_name']):
             logger.warning("Phase3: 无法打开会话 %s，下轮重试", pm['who'][:20])
+            _return_to_session_list()
+            continue
+
+        if not _wait_chat_stable(pm['chat_name'], max_wait=2.0):
+            logger.warning("Phase3: 打开后验证失败 %s，跳过", pm['who'][:20])
             _return_to_session_list()
             continue
 
