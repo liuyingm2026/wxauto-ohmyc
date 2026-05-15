@@ -618,6 +618,44 @@ _last_force_refresh = 0.0 # 上次强制返回聊天列表的时间戳
 EMPTY_READ_COOLDOWN = 45  # 空读冷却秒数
 FORCE_REFRESH_INTERVAL = 30  # 强制返回聊天列表的最小间隔（秒），避免频繁抢焦点
 
+def _search_clear_and_type(wx, text):
+    """清空搜索框并输入新文本（兼容 WeChat 3.9.11）。
+
+    UIA SendKeys 在搜索框未正确聚焦时无效，B_Search.SendKeys 对文本输入不可靠。
+    使用 pyautogui 清空（Ctrl+A+Backspace），再用 UiaAPI.SendKeys 输入文本
+    （避免 pyautogui 触发中文输入法）。
+    """
+    rect = wx.B_Search.BoundingRectangle
+    sx = (rect.left + rect.right) // 2
+    sy = (rect.top + rect.bottom) // 2
+
+    try:
+        import pyautogui
+        # 点击搜索框获取焦点
+        pyautogui.click(sx, sy)
+        time.sleep(0.15)
+        # Ctrl+A 全选 + Backspace 清空
+        pyautogui.hotkey('ctrl', 'a')
+        time.sleep(0.05)
+        pyautogui.press('backspace')
+        time.sleep(0.15)
+        # 再次点击确保焦点
+        pyautogui.click(sx, sy)
+        time.sleep(0.1)
+    except ImportError:
+        # 兜底：用 UIA 点击搜索框
+        try:
+            wx.B_Search.Click(simulateMove=False)
+        except Exception:
+            pass
+        time.sleep(0.15)
+        wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.2)
+        time.sleep(0.1)
+
+    # UiaAPI.SendKeys 不会触发中文输入法，用于输入英文文本
+    wx.UiaAPI.SendKeys(text, waitTime=0.8)
+    logger.debug("_search_clear_and_type: 搜索框已输入 '%s'", text[:20])
+
 def prime_startup_messages(wx, seen):
     """启动时将现有未读消息全部标记为已读，不回复。
     解决长时间不登录后消息积压的问题——这些积压消息属于过去，不应自动回复。"""
@@ -655,11 +693,7 @@ def prime_startup_messages(wx, seen):
 
             # 搜索过滤
             _ensure_foreground(wx)
-            wx.B_Search.Click(simulateMove=False)
-            time.sleep(0.15)
-            wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.2)
-            time.sleep(0.1)
-            wx.B_Search.SendKeys(who, waitTime=1.0)
+            _search_clear_and_type(wx, who)
             time.sleep(0.8)
 
             # 侧边栏 RegexName 精确点击
@@ -807,15 +841,12 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                 break
 
         # ── Step 3: 搜索过滤 + 侧边栏点击（不使用 ENTER） ──
+        # WeChat 3.9.11: UIA SendKeys 无法可靠清空搜索框，用 pyautogui 兜底
         try:
             _ensure_foreground(wx)
-            wx.B_Search.Click(simulateMove=False)
+            _search_clear_and_type(wx, target_name)
         except Exception:
             pass
-        time.sleep(0.15)
-        wx.UiaAPI.SendKeys('{Ctrl}a{BACK}', waitTime=0.2)
-        time.sleep(0.1)
-        wx.B_Search.SendKeys(target_name, waitTime=1.0)
         time.sleep(0.8)
 
         # 搜索过滤后重新尝试 RegexName
