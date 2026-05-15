@@ -493,9 +493,12 @@ def verify_chat_window(wx, expected_name):
     return False
 
 
-def wait_chat_stable(wx, target_name, max_wait=3.0, check_interval=0.3):
+def wait_chat_stable(wx, target_name, max_wait=3.0, check_interval=0.3, before_title=None):
     """验证微信窗口标题已切换到目标会话，连续两次匹配才确认切换完成。
     同时检查 UIA 和 win32gui 两种路径，任一匹配即可。
+
+    若 before_title 传入，则标题从 before_title 变为其他值也视为切换成功
+    （ChatBox.TextControl 在 WeChat 3.9.x 中可能不准确，无法要求精确名称匹配）。
     max_wait: 最长等待秒数，超时返回 False。"""
     deadline = time.time() + max_wait
     last_match = False
@@ -507,11 +510,17 @@ def wait_chat_stable(wx, target_name, max_wait=3.0, check_interval=0.3):
             if last_match:
                 return True
             last_match = True
+        elif before_title is not None and current and current != before_title:
+            # 标题已变化但无法精确匹配 → 窗口已切换，接受
+            logger.debug("wait_chat_stable: 标题变化 '%s' → '%s' ≠ 期望 '%s'，假定切换成功",
+                        before_title[:20], current[:20], target_name[:20])
+            return True
         else:
             last_match = False
         time.sleep(check_interval)
-    logger.warning("wait_chat_stable 验证超时: 期望='%s' UIA='%s' win32='%s'",
+    logger.warning("wait_chat_stable 验证超时: 期望='%s' before='%s' UIA='%s' win32='%s'",
                    target_name[:20],
+                   (before_title or '')[:20],
                    get_current_chat_name(wx)[:30],
                    get_chat_name_win32(wx)[:30])
     return False
@@ -719,6 +728,9 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
 
         任一步验证通过即返回 True。三步全失败返回 False，
         调用方应跳过此会话。旧版永远返回 True 是串聊回复的根因。
+
+        wait_chat_stable 不仅检查名称匹配，也会检查标题是否变化
+        （ChatBox.TextControl.Name 在 WeChat 3.9.x 中可能不可靠）。
         """
         import re as _re
         pattern = f'^{_re.escape(target_name)}(\\d+条新消息)?(已置顶)?$'
@@ -735,13 +747,15 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         time.sleep(0.3)
 
         # ── Step 1: RegexName 精确匹配 → 验证 ─────────────
+        before = None
         try:
+            before = get_current_chat_name(wx) or get_chat_name_win32(wx)
             item = wx.SessionBox.ListItemControl(RegexName=pattern)
             if item.Exists(2.0):
                 logger.info("_open: RegexName 命中 '%s'", target_name[:20])
                 item.Click(simulateMove=False)
                 time.sleep(0.5)
-                if _wait_chat_stable(target_name):
+                if _wait_chat_stable(target_name, before_title=before):
                     logger.info("_open: RegexName -> '%s'", target_name[:20])
                     return True
                 logger.warning("_open: RegexName 点击后验证失败 '%s'", target_name[:20])
@@ -749,6 +763,7 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
             pass
 
         # ── Step 2: Sibling 遍历精确匹配 → 验证 ──────────
+        before = get_current_chat_name(wx) or get_chat_name_win32(wx)
         item = wx.SessionBox.ListItemControl()
         for _ in range(80):
             try:
@@ -759,7 +774,7 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                     logger.info("_open: sibling 匹配 '%s'", name[:25])
                     item.Click(simulateMove=False)
                     time.sleep(0.5)
-                    if _wait_chat_stable(target_name):
+                    if _wait_chat_stable(target_name, before_title=before):
                         logger.info("_open: sibling -> '%s'", target_name[:20])
                         return True
                     logger.warning("_open: sibling 验证失败 '%s'", target_name[:20])
@@ -783,19 +798,21 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         time.sleep(0.8)
 
         # 搜索过滤后重新尝试 RegexName
+        before = get_current_chat_name(wx) or get_chat_name_win32(wx)
         try:
             item = wx.SessionBox.ListItemControl(RegexName=pattern)
             if item.Exists(2.0):
                 logger.info("_open: 搜索+RegexName 命中 '%s'", target_name[:20])
                 item.Click(simulateMove=False)
                 time.sleep(0.5)
-                if _wait_chat_stable(target_name):
+                if _wait_chat_stable(target_name, before_title=before):
                     logger.info("_open: 搜索+RegexName -> '%s'", target_name[:20])
                     return True
         except Exception:
             pass
 
         # 搜索后 Sibling 遍历兜底
+        before = get_current_chat_name(wx) or get_chat_name_win32(wx)
         item = wx.SessionBox.ListItemControl()
         for _ in range(80):
             try:
@@ -806,7 +823,7 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                     logger.info("_open: 搜索+sibling 匹配 '%s'", name[:25])
                     item.Click(simulateMove=False)
                     time.sleep(0.5)
-                    if _wait_chat_stable(target_name):
+                    if _wait_chat_stable(target_name, before_title=before):
                         logger.info("_open: 搜索+sibling -> '%s'", target_name[:20])
                         return True
                     break
@@ -819,9 +836,9 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         logger.warning("_open_session 全部失败: '%s'", target_name[:20])
         return False
 
-    def _wait_chat_stable(target_name, max_wait=3.0, check_interval=0.3):
+    def _wait_chat_stable(target_name, max_wait=3.0, check_interval=0.3, before_title=None):
         """验证窗口标题已切换到目标会话，连续两次匹配才确认。"""
-        return wait_chat_stable(wx, target_name, max_wait, check_interval)
+        return wait_chat_stable(wx, target_name, max_wait, check_interval, before_title)
 
     def _return_to_session_list():
         """返回微信聊天列表，确保离开会话内部视图。"""
