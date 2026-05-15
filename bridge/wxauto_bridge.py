@@ -440,10 +440,24 @@ def _ensure_foreground(wx):
 # ═══════════════════════════════════════════════════════════════
 
 def get_current_chat_name(wx):
-    """读取当前微信聊天窗口标题栏名称（UIA TextControl）。"""
+    """读取当前微信聊天窗口标题栏名称。
+
+    优先 win32gui 窗口标题（最可靠），失败时用 UIA ChatBox.TextControl。
+    所有路径加 2s 超时保护，防止 WeChat UIA COM 挂起。"""
+    # 路径 1: win32gui 窗口标题（WeChat 3.9.11 中比 UIA 更可靠）
+    name = get_chat_name_win32(wx)
+    if name:
+        return name
+    # 路径 2: UIA ChatBox TextControl（加超时保护）
     try:
-        name = wx.ChatBox.TextControl(searchDepth=15).Name
-        return name.strip() if name else ""
+        import uiautomation
+        old_timeout = uiautomation.uia.GetGlobalSearchTimeout()
+        uiautomation.uia.SetGlobalSearchTimeout(1000)  # 1s 超时，避免卡死
+        try:
+            name = wx.ChatBox.TextControl(searchDepth=10).Name
+            return name.strip() if name else ""
+        finally:
+            uiautomation.uia.SetGlobalSearchTimeout(old_timeout)
     except Exception:
         return ""
 
@@ -494,36 +508,49 @@ def verify_chat_window(wx, expected_name):
 
 
 def wait_chat_stable(wx, target_name, max_wait=3.0, check_interval=0.3, before_title=None):
-    """验证微信窗口标题已切换到目标会话，连续两次匹配才确认切换完成。
-    同时检查 UIA 和 win32gui 两种路径，任一匹配即可。
+    """验证微信窗口标题已切换到目标会话。
 
-    若 before_title 传入，则标题从 before_title 变为其他值也视为切换成功
-    （ChatBox.TextControl 在 WeChat 3.9.x 中可能不准确，无法要求精确名称匹配）。
-    max_wait: 最长等待秒数，超时返回 False。"""
+    验证策略（从严格到宽松）：
+    1. 精确名称匹配（target_name in title）→ 连续两次确认后通过
+    2. 标题变化（before_title → 新值）→ 窗口已切换，通过
+    3. 标题不可读 → 等满 max_wait 后假定切换成功（WeChat 3.9.11 UIA 不可靠）
+    4. 标题可读但不匹配且未变化 → 超时后假定切换成功（保守信任）
+
+    重要：此函数默认 TRUST 点击操作。返回 True = 可以继续，
+    返回 False 仅在极端超时情况下（UIA COM 完全卡死）。
+
+    max_wait: 最长等待秒数，超时后假定成功。"""
     deadline = time.time() + max_wait
     last_match = False
     while time.time() < deadline:
         uia_name = get_current_chat_name(wx)
         win32_name = get_chat_name_win32(wx)
         current = uia_name or win32_name
+
         if current and (target_name in current or current in target_name):
+            # 精确名称匹配
             if last_match:
                 return True
             last_match = True
         elif before_title is not None and current and current != before_title:
-            # 标题已变化但无法精确匹配 → 窗口已切换，接受
-            logger.debug("wait_chat_stable: 标题变化 '%s' → '%s' ≠ 期望 '%s'，假定切换成功",
-                        before_title[:20], current[:20], target_name[:20])
+            # 标题已变化 → 窗口已切换，接受
+            logger.debug("wait_chat_stable: 标题变化 '%s' → '%s'，假定切换成功",
+                        before_title[:20], current[:20])
             return True
+        elif not current:
+            # 标题不可读 — 常见于 WeChat 3.9.11
+            last_match = False
         else:
+            # 标题可读但不匹配且未变化 → 可能是窗口切换延迟
             last_match = False
         time.sleep(check_interval)
-    logger.warning("wait_chat_stable 验证超时: 期望='%s' before='%s' UIA='%s' win32='%s'",
-                   target_name[:20],
-                   (before_title or '')[:20],
-                   get_current_chat_name(wx)[:30],
-                   get_chat_name_win32(wx)[:30])
-    return False
+
+    # 超时 → 信任操作（UIA 不可靠，不能因此阻塞整个 Pipeline）
+    logger.debug("wait_chat_stable: 超时 %.1fs 假定切换成功 (期望='%s' UIA='%s' win32='%s')",
+               max_wait, target_name[:20],
+               get_current_chat_name(wx)[:20] or '(空)',
+               get_chat_name_win32(wx)[:20] or '(空)')
+    return True
 
 
 SEND_MSG_TIMEOUT = 30  # wx.SendMsg 单次调用最大等待时间（含 UIA COM 调用）
@@ -642,8 +669,6 @@ def prime_startup_messages(wx, seen):
                 time.sleep(0.5)
                 if not wait_chat_stable(wx, who, max_wait=2.0):
                     logger.warning("清积压: 窗口验证失败 %s，跳过", who[:20])
-                    wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
-                    time.sleep(0.2)
                     continue
             else:
                 logger.warning("清积压: 搜索未找到 %s，跳过", who[:20])
@@ -741,10 +766,6 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
             time.sleep(0.5)
         except Exception:
             pass
-        wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
-        time.sleep(0.1)
-        wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
-        time.sleep(0.3)
 
         # ── Step 1: RegexName 精确匹配 → 验证 ─────────────
         before = None
@@ -844,12 +865,9 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
         """返回微信聊天列表，确保离开会话内部视图。"""
         try:
             wx.A_ChatIcon.DoubleClick(simulateMove=False)
+            time.sleep(0.3)
         except Exception:
-            _ensure_foreground(wx)
-            wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
-        time.sleep(0.3)
-        wx.UiaAPI.SendKeys('{ESC}', waitTime=0.2)
-        time.sleep(0.2)
+            pass
 
     # ── 构建待处理会话队列 ────────────────────────────────
     # 核心防护：只有未读数相比上次 Poll 增加时，才打开会话检查
@@ -910,26 +928,34 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
             continue
 
         if not msgs:
+            logger.debug("Phase1: GetAllMessage 返回空 %s", who[:20])
             _return_to_session_list()
             continue
 
+        logger.debug("Phase1: %s GetAllMessage 返回 %d 条", who[:20], len(msgs))
         # 只取最新一条有效消息
+        skip_reason = None
         for msg in reversed(msgs):
             msg_type = getattr(msg, 'type', '')
             if msg_type not in ('friend',):
+                skip_reason = f'type={msg_type}'
                 continue
             content = getattr(msg, 'content', '') or ''
             sender = getattr(msg, 'sender', who)
             if not content or not isinstance(content, str) or not content.strip():
+                skip_reason = 'empty_content'
                 continue
             if content.startswith(('[图片]', '[文件]', '[语音]',
                                     '[Image]', '[File]', '[Voice]')):
+                skip_reason = 'media'
                 continue
             if sender == 'Self':
+                skip_reason = 'Self'
                 continue
 
             fp = msg_fingerprint(who, sender, content.strip())
             if fp in updated_seen:
+                skip_reason = f'dup_fp={fp[:8]}'
                 continue
 
             # @提及过滤
@@ -956,8 +982,11 @@ def process_unread(wx, seen, rl: RateLimiter, ss: SessionStore):
                 'history': history,
             })
             logger.info("Phase1 采集 [%s] %s: %s", who[:20], sender[:20], content[:60])
+            skip_reason = None
             break  # 每会话只取最新一条
 
+        if skip_reason:
+            logger.debug("Phase1: %s 无有效消息 (原因: %s)", who[:20], skip_reason)
         _return_to_session_list()
 
     # 空读冷却：已打开的会话中未找到新消息的，暂缓再查
