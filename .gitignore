@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+data/bridge.log
+data/bridge_nohup.log
+
+# Runtime state (exclude: may contain sensitive user data)
+data/bridge_state.json
+data/bridge.pid
+data/conversation_history.json
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+nul
+
+# Config with secrets
+.env
+*.secret
