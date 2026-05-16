@@ -678,12 +678,15 @@ def _scroll_for_unread(wx, max_pages=10):
     return all_unread
 
 
-def _read_sessionbox_preview(wx):
+def _read_sessionbox_preview(wx, max_pages=5):
     """从 SessionBox UIA 树读取消息预览（无需打开聊天窗口）。
 
     当 RDP 断开导致微信 ChatBox 中 C_MsgList 不可见时，
     GetAllMessage() 返回空。此函数直接从 SessionBox 的
     ListItemControl 子控件中提取最后一条消息预览作为兜底。
+
+    微信 SessionBox 虚拟化：只有前 ~10 个会话的 UIA 子树完整。
+    此函数逐页滚动，覆盖更多不可见的会话。
 
     SessionBox ListItemControl 结构 (WeChat 3.9.11):
       ListItemControl Name='测试自动回复3条新消息'
@@ -699,87 +702,114 @@ def _read_sessionbox_preview(wx):
 
     Returns:
         dict: {session_name: (sender, content_preview)}
-        仅返回有预览文本的可见会话（不可见=无有效子控件）
     """
+    def _scan_visible():
+        """扫描当前可见的 SessionBox 项，返回 {name: (sender, content)}"""
+        result = {}
+        try:
+            item = wx.SessionBox.ListItemControl()
+            for _ in range(200):
+                if item is None:
+                    break
+                try:
+                    raw_name = item.Name or ''
+                    clean_name = _strip_badges(raw_name)
+                    if not clean_name or clean_name in SKIP_SESSIONS:
+                        item = item.GetNextSiblingControl()
+                        continue
+                    if ALLOW_SESSIONS and clean_name not in ALLOW_SESSIONS:
+                        item = item.GetNextSiblingControl()
+                        continue
+                    if clean_name in result:  # already found in earlier page
+                        item = item.GetNextSiblingControl()
+                        continue
+
+                    pane = item.PaneControl()
+                    text_controls = []
+                    if pane and pane.Exists(0.2):
+                        children = pane.GetChildren()
+                        for child in children:
+                            if child.ControlTypeName == 'TextControl':
+                                text_controls.append(child.Name or '')
+
+                    if len(text_controls) < 2:
+                        item = item.GetNextSiblingControl()
+                        continue
+
+                    preview_text = None
+                    for tc in text_controls:
+                        t = tc.strip()
+                        if not t or t == clean_name:
+                            continue
+                        if re.match(r'^\d{1,2}:\d{2}$', t) or t.isdigit():
+                            continue
+                        if re.match(r'^\d+月\d+日$', t) or re.match(r'^\d+/\d+', t):
+                            continue
+                        if t in ('昨天', '前天', '今天', '星期日', '星期一', '星期二',
+                                  '星期三', '星期四', '星期五', '星期六'):
+                            continue
+                        if any(c.isalpha() or '\u4e00' <= c <= '\u9fff' for c in t):
+                            preview_text = t
+                            break
+
+                    if not preview_text:
+                        item = item.GetNextSiblingControl()
+                        continue
+
+                    sender = clean_name
+                    content_preview = preview_text
+                    for sep in ('：', ':'):
+                        if sep in preview_text:
+                            parts = preview_text.split(sep, 1)
+                            if len(parts) == 2 and parts[0].strip():
+                                sender = parts[0].strip()
+                                content_preview = parts[1].strip()
+                            break
+                    result[clean_name] = (sender, content_preview)
+                except Exception:
+                    pass
+                try:
+                    item = item.GetNextSiblingControl()
+                except Exception:
+                    break
+        except Exception:
+            pass
+        return result
+
     previews = {}
     try:
-        item = wx.SessionBox.ListItemControl()
-        for _ in range(200):
-            if item is None:
-                break
+        # 第 1 页：当前可见区域
+        previews.update(_scan_visible())
+        seen_names = set(previews.keys())
 
+        # 滚动覆盖更多页
+        for page in range(1, max_pages):
             try:
-                raw_name = item.Name or ''
-                clean_name = _strip_badges(raw_name)
-                if not clean_name or clean_name in SKIP_SESSIONS:
-                    item = item.GetNextSiblingControl()
-                    continue
-                if ALLOW_SESSIONS and clean_name not in ALLOW_SESSIONS:
-                    item = item.GetNextSiblingControl()
-                    continue
+                import pyautogui
+                pyautogui.FAILSAFE = False
+                sbox = wx.SessionBox.BoundingRectangle
+                scroll_x = (sbox.left + sbox.right) // 2
+                scroll_y = (sbox.top + sbox.bottom) // 2
+                pyautogui.click(scroll_x, scroll_y)
+                time.sleep(0.08)
+                pyautogui.scroll(-3)
+                time.sleep(0.35)
+            except ImportError:
+                try:
+                    wx.UiaAPI.SendKeys('{PageDown}', waitTime=0.25)
+                except Exception:
+                    pass
+                time.sleep(0.35)
 
-                # Walk into PaneControl to get TextControl children
-                pane = item.PaneControl()
-                text_controls = []
-                if pane and pane.Exists(0.3):
-                    children = pane.GetChildren()
-                    for child in children:
-                        if child.ControlTypeName == 'TextControl':
-                            text_controls.append(child.Name or '')
+            new_results = _scan_visible()
+            new_names = set(new_results.keys()) - seen_names
+            if not new_names:
+                break  # 没有新会话，说明已到底
+            for k, v in new_results.items():
+                if k not in previews:
+                    previews[k] = v
+            seen_names.update(new_names)
 
-                if len(text_controls) < 2:
-                    item = item.GetNextSiblingControl()
-                    continue
-
-                # Extract preview: find text with message-like content
-                preview_text = None
-                for tc in text_controls:
-                    t = tc.strip()
-                    if not t:
-                        continue
-                    if t == clean_name:
-                        continue
-                    # Skip time patterns (HH:MM, H:MM, yesterday, date)
-                    if re.match(r'^\d{1,2}:\d{2}$', t):
-                        continue
-                    # Skip pure digits (badge count)
-                    if t.isdigit():
-                        continue
-                    # Skip date patterns
-                    if re.match(r'^\d+月\d+日$', t) or re.match(r'^\d+/\d+', t) or re.match(r'^星期', t):
-                        continue
-                    # Skip day labels
-                    if t in ('昨天', '前天', '今天', '星期日', '星期一', '星期二',
-                              '星期三', '星期四', '星期五', '星期六'):
-                        continue
-                    # This looks like a message preview
-                    if any(c.isalpha() or '\u4e00' <= c <= '\u9fff' for c in t):
-                        preview_text = t
-                        break
-
-                if not preview_text:
-                    item = item.GetNextSiblingControl()
-                    continue
-
-                # Parse sender and content from "Sender：Content"
-                sender = clean_name
-                content_preview = preview_text
-                for sep in ('：', ':'):
-                    if sep in preview_text:
-                        parts = preview_text.split(sep, 1)
-                        if len(parts) == 2 and parts[0].strip():
-                            sender = parts[0].strip()
-                            content_preview = parts[1].strip()
-                        break
-
-                previews[clean_name] = (sender, content_preview)
-            except Exception:
-                pass
-
-            try:
-                item = item.GetNextSiblingControl()
-            except Exception:
-                break
     except Exception as e:
         logger.warning("_read_sessionbox_preview 异常: %s", e)
 
